@@ -973,48 +973,6 @@ def post_reorder_deepgemm(
 
 
 @triton.jit
-def post_reorder_triton_kernel(
-    down_output_ptr,
-    output_ptr,
-    src2dst_ptr,
-    topk_ids_ptr,
-    topk_weights_ptr,
-    topk,
-    hidden_size,
-    BLOCK_SIZE: tl.constexpr,
-):
-    InDtype = down_output_ptr.dtype.element_ty
-
-    src_idx_int32 = tl.program_id(0)
-    src_idx = src_idx_int32.to(tl.int64)
-    src2dst_ptr = src2dst_ptr + src_idx * topk
-    topk_ids_ptr = topk_ids_ptr + src_idx * topk
-    topk_weights_ptr = topk_weights_ptr + src_idx * topk
-
-    store_ptr = output_ptr + src_idx * hidden_size
-
-    vec = tl.arange(0, BLOCK_SIZE)
-
-    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-        offset = start_offset + vec
-        mask = offset < hidden_size
-
-        sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        for idx in range(topk):
-            expert_id = tl.load(topk_ids_ptr + idx)
-            if expert_id >= 0:
-                dst_idx_int32 = tl.load(src2dst_ptr + idx)
-                dst_idx = dst_idx_int32.to(tl.int64)
-                weigh_scale = tl.load(topk_weights_ptr + idx).to(tl.float32)
-                load_ptr = down_output_ptr + dst_idx * hidden_size
-                # accumulate expert outputs in fp32 for better precision
-                # before casting to the final output dtype.
-                in_data = tl.load(load_ptr + offset, mask=mask).to(tl.float32)
-                sum_vec += in_data * weigh_scale
-        tl.store(store_ptr + offset, sum_vec.to(InDtype), mask=mask)
-
-
-@triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     num_valid_tokens_per_expert,
@@ -1033,9 +991,14 @@ def _fwd_kernel_ep_scatter_1(
         other=0,
     )
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
-    tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
-    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    # Each program finalizes only its own expert's offset. Reading it back from
+    # expert_start_loc would depend on the visibility of the vector store above
+    # (issued across this block's warps), so select the value from the
+    # in-register cumsum instead; a garbage base pointer would produce an
+    # intermittent warp illegal address in the m_indices store loop below.
+    cur_expert_start = tl.sum(tl.where(offset_cumsum == cur_expert, cumsum, 0))
+    tl.store(expert_start_loc + cur_expert, cur_expert_start)
     cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
     cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
 
@@ -1044,9 +1007,11 @@ def _fwd_kernel_ep_scatter_1(
 
     for start_m in tl.range(0, cur_expert_padded_token_num, BLOCK_E, num_stages=4):
         offsets = start_m + off_expert
+        # Safety net; callers already pad the counts to BLOCK_E.
         tl.store(
             m_indices_start_ptr + offsets,
             tl.where(offsets < cur_expert_valid_token_num, cur_expert, -1),
+            mask=offsets < cur_expert_padded_token_num,
         )
 
 
@@ -1158,8 +1123,8 @@ def ep_scatter(
     expert_alignment: int = 128,
     expert_start: int = 0,
 ):
-    # tl.arange needs pow2, and the kernel's unmasked stores need BLOCK_E to
-    # divide the expert_alignment-padded segments; lowbit satisfies both.
+    # tl.arange needs pow2; lowbit gives the largest pow2 dividing
+    # expert_alignment, which callers pad the per-expert counts to.
     BLOCK_E = expert_alignment & -expert_alignment
     BLOCK_D = quant_block_size  # block size of quantization
     num_warps = 8
