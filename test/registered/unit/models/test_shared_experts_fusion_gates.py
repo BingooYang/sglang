@@ -263,6 +263,22 @@ class TestDeepseekV2Gate(_FusionGateCase):
             )
 
 
+class TestDeepseekV2SharedExpertTP1(_FusionGateCase):
+    def test_dwdp_replicates_the_shared_expert(self):
+        """DWDP skips the post-experts all-reduce, so a TP-sharded shared expert
+        would add only its partial output on each rank."""
+        from sglang.srt.models.deepseek_v2 import shared_experts_use_tp1
+
+        with get_parallel().override(dwdp_size=8):
+            self.assertTrue(shared_experts_use_tp1())
+
+    def test_plain_tp_keeps_the_shared_expert_sharded(self):
+        from sglang.srt.models.deepseek_v2 import shared_experts_use_tp1
+
+        with get_parallel().override(dwdp_size=1):
+            self.assertFalse(shared_experts_use_tp1())
+
+
 class TestGlmMoeLiteGate(_FusionGateCase):
     def _config(self, **kw):
         base = dict(architectures=["Glm4MoeLiteForCausalLM"], n_shared_experts=1)
@@ -309,12 +325,19 @@ class TestGlmMoeGate(_FusionGateCase):
         )
         self.assertTrue(reason)
 
-    def test_the_dsa_variant_declares_its_own_architecture(self):
-        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+    def test_the_dsa_nextn_draft_can_fuse_the_target_layout(self):
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
 
-        self.assertEqual(
-            GlmMoeDsaForCausalLM.fused_shared_experts_architecture,
-            "GlmMoeDsaForCausalLM",
+        self._seed()
+        draft_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLMNextN"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+            num_hidden_layers=78,
+        )
+        self.assertNotIn(
+            "does not support",
+            self._reason(GlmMoeDsaForCausalLMNextN, draft_config) or "",
         )
 
 
